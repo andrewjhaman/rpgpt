@@ -3943,9 +3943,11 @@ Vec2 threedee_to_screenspace(Vec3 world)
 		// divide produces nans. 
 		Vec3 clip_space;
 
-		if (clip_space_no_perspective_divide.z < 0.0) {
+		if (clip_space_no_perspective_divide.z < 0.0f)
+		{
 			return V2(0.0, 0.0);
 		}
+
 
 		if(clip_space_no_perspective_divide.w != 0.0)
 		{
@@ -4980,68 +4982,76 @@ float round_to_nearest(float input, float round_target)
     return result;
 }
 
-Shadow_Volume_Params calculate_shadow_volume_params(Vec3 light_dir) 
+typedef struct
+{
+	//For now we consider all vertices on the near plane to be equal to the camera position, and store that at vertices[0];
+	Vec3 vertices[5];
+} FrustumVertices;
+
+FrustumVertices get_frustum_vertices(Vec3 cam_pos, Vec3 cam_forward, Vec3 cam_right) {
+	FrustumVertices result = {0};
+
+	float aspect_ratio = (float)sapp_width() / (float)sapp_height();
+
+	const int num_frustum_vertices = sizeof(result.vertices)/sizeof(result.vertices[0]);
+
+	const float cascade_distance = FAR_PLANE_DISTANCE;
+
+	Vec2 far_plane_half_dims;
+	far_plane_half_dims.y = cascade_distance * tanf(FIELD_OF_VIEW * 0.5f);
+	far_plane_half_dims.x = far_plane_half_dims.y * aspect_ratio;
+
+	Vec3 cam_up = Cross(cam_right, cam_forward); 
+
+	Vec3 far_plane_centre = AddV3(cam_pos, MulV3F(cam_forward, cascade_distance));
+	Vec3 far_plane_offset_to_right_side  = MulV3F(cam_right, far_plane_half_dims.x);
+	Vec3 far_plane_offset_to_top_side    = MulV3F(cam_up   , far_plane_half_dims.y);
+	Vec3 far_plane_offset_to_left_side   = MulV3F(far_plane_offset_to_right_side, -1.0); 
+	Vec3 far_plane_offset_to_bot_side    = MulV3F(far_plane_offset_to_top_side  , -1.0);   
+
+	result.vertices[0] = cam_pos;
+	result.vertices[1] = AddV3(far_plane_centre, AddV3(far_plane_offset_to_bot_side, far_plane_offset_to_left_side ));
+	result.vertices[2] = AddV3(far_plane_centre, AddV3(far_plane_offset_to_bot_side, far_plane_offset_to_right_side));
+	result.vertices[3] = AddV3(far_plane_centre, AddV3(far_plane_offset_to_top_side, far_plane_offset_to_right_side));
+	result.vertices[4] = AddV3(far_plane_centre, AddV3(far_plane_offset_to_top_side, far_plane_offset_to_left_side ));
+
+
+	return result;
+}
+
+Shadow_Volume_Params calculate_shadow_volume_params(Vec3 light_dir, Vec3 cam_pos, Vec3 cam_forward, Vec3 cam_right) 
 {
 	Shadow_Volume_Params result = {0};
 
-
-	//first, we calculate the scene bound
-	//NOTE: Once we are moved to a pre-pass queue making type deal, this could be moved into that 
-	//      loop.
-
-	//For simplicity and speed, at the moment we consider only entity positions, not their extents when constructing the scene bounds.
-	//To make up for this, we add an extra padding-skirt to the bounds.
 	Mat4 light_space_matrix = LookAt_RH((Vec3){0}, light_dir, V3(0, 1, 0));
 
-	Vec3 scene_min = V3( INFINITY,  INFINITY,  INFINITY);
-	Vec3 scene_max = V3(-INFINITY, -INFINITY, -INFINITY);
+	Vec3 frustum_min = V3( INFINITY,  INFINITY,  INFINITY);
+	Vec3 frustum_max = V3(-INFINITY, -INFINITY, -INFINITY);
 
-	for(PlacedMesh *cur = level_threedee.placed_mesh_list; cur; cur = cur->next)
-	{
-		Vec3 p = MulM4V3(light_space_matrix, cur->t.offset);
 
-		scene_min.x = fminf(scene_min.x, p.x);
-		scene_max.x = fmaxf(scene_max.x, p.x);
+	FrustumVertices frustum_vertices_worldspace = get_frustum_vertices(cam_pos, cam_forward, cam_right);
+	const int num_frustum_vertices = sizeof(frustum_vertices_worldspace.vertices)/sizeof(frustum_vertices_worldspace.vertices[0]);
 
-		scene_min.y = fminf(scene_min.y, p.y);
-		scene_max.y = fmaxf(scene_max.y, p.y);
+	for (int i = 0; i < num_frustum_vertices; ++i) {
+		Vec3 p = frustum_vertices_worldspace.vertices[i];
+
+		p = MulM4V3(light_space_matrix, p);
+
+		frustum_min.x = fminf(frustum_min.x, p.x);
+		frustum_max.x = fmaxf(frustum_max.x, p.x);
+
+		frustum_min.y = fminf(frustum_min.y, p.y);
+		frustum_max.y = fmaxf(frustum_max.y, p.y);
 		
-		scene_min.z = fminf(scene_min.z, p.z);
-		scene_max.z = fmaxf(scene_max.z, p.z);
+		frustum_min.z = fminf(frustum_min.z, p.z);
+		frustum_max.z = fmaxf(frustum_max.z, p.z);	
 	}
 
-	ENTITIES_ITER(gs.entities)
-	{
-		if(it->is_npc || it->is_character)
-		{
-			Transform draw_with = entity_transform(it);
-			Vec3 p = MulM4V3(light_space_matrix, draw_with.offset);
+	result.l = frustum_min.x;
+	result.r = frustum_max.x;
 
-			scene_min.x = fminf(scene_min.x, p.x);
-			scene_max.x = fmaxf(scene_max.x, p.x);
-	
-			scene_min.y = fminf(scene_min.y, p.y);
-			scene_max.y = fmaxf(scene_max.y, p.y);
-			
-			scene_min.z = fminf(scene_min.z, p.z);
-			scene_max.z = fmaxf(scene_max.z, p.z);
-		}
-	}
-
-	//pad to account for entity width
-	float pad = 2.5f;
-
-	scene_min.x -= pad;
-	scene_min.y -= pad;
-
-	scene_max.x += pad;
-	scene_max.y += pad;
-
-	result.l = scene_min.x;
-	result.r = scene_max.x;
-
-	result.b = scene_min.y;
-	result.t = scene_max.y;
+	result.b = frustum_min.y;
+	result.t = frustum_max.y;
 
 	float w = result.r - result.l;
 	float h = result.t - result.b;
@@ -5062,7 +5072,6 @@ Shadow_Volume_Params calculate_shadow_volume_params(Vec3 light_dir)
 		}
 	}
 
-
 	{//Snap the light position to shadow_map texel grid, to reduce shimmering when moving
 		float texel_size = actual_size / (float)SHADOW_MAP_DIMENSION;
 		result.l = round_to_nearest(result.l, texel_size);
@@ -5071,11 +5080,57 @@ Shadow_Volume_Params calculate_shadow_volume_params(Vec3 light_dir)
 		result.t = round_to_nearest(result.t, texel_size);
 	}
 
-	result.n = -100.0;
-	result.f = 200.0;
+	result.n = -200.0;
+	result.f =  200.0;
 
 
 	return result;
+}
+
+void debug_draw_img(sg_image img, int index) {
+    draw_quad((DrawParams){quad_at(V2(512.0f*index, 512.0), V2(512.0, 512.0)), IMG(state.shadows.color_img), WHITE, .layer=LAYER_UI});
+}
+
+void debug_draw_img_with_border(sg_image img, int index) {
+    float bs = 50.0;
+    draw_quad((DrawParams){quad_at(V2(512.0f*index, 512.0), V2(512.0, 512.0)), state.shadows.color_img, (AABB){V2(-bs, -bs), AddV2(img_size(img), V2(bs, bs))}, WHITE, .layer=LAYER_UI});
+}
+
+void debug_draw_shadow_info(Vec3 frustum_tip, Vec3 cam_forward, Vec3 cam_right, Mat4 light_space_matrix) {
+		debug_draw_img(state.shadows.color_img, 0);
+		FrustumVertices fv = get_frustum_vertices(frustum_tip, cam_forward, cam_right);
+
+		Vec2 projs[5];
+		for (int i = 0; i < 5; ++i) {
+			Vec3 v = fv.vertices[i];
+			Vec4 p = V4(v.x, v.y, v.z, 1.0);
+			Vec4 proj = MulM4V4(light_space_matrix, p);
+			proj.x /= proj.w;
+			proj.y /= proj.w;
+			proj.z /= proj.w;
+
+			proj.x *= 0.5f;
+			proj.x += 0.5f;
+			proj.y *= 0.5f;
+			proj.y += 0.5f;
+			proj.z *= 0.5f;
+			proj.z += 0.5f;
+
+			proj.x *= 512.0f;
+			proj.y *= 512.0f;
+
+			projs[i] = proj.XY;
+			dbgsquare(proj.XY);
+		}
+
+		dbgline(projs[0], projs[1]);
+		dbgline(projs[0], projs[2]);
+		dbgline(projs[0], projs[3]);
+		dbgline(projs[0], projs[4]);
+		dbgline(projs[1], projs[2]);
+		dbgline(projs[2], projs[3]);
+		dbgline(projs[3], projs[4]);
+		dbgline(projs[4], projs[1]);
 }
 
 void frame(void)
@@ -5113,6 +5168,8 @@ void frame(void)
 	}
 	return;
 #endif
+
+
 
 	PROFILE_SCOPE("frame")
 	{
@@ -5156,6 +5213,30 @@ void frame(void)
 			movement = NormV2(movement);
 		}
 
+		Vec3 facing;
+		Vec3 right;
+		{//Setup the Camera Matrices
+			// make movement relative to camera forward
+			facing = NormV3(SubV3(player_pos, cam_pos));
+			right = Cross(facing, V3(0,1,0));
+			Vec2 forward_2d = NormV2(V2(facing.x, facing.z));
+			Vec2 right_2d = NormV2(V2(right.x, right.z));
+			movement = AddV2(MulV2F(forward_2d, movement.y), MulV2F(right_2d, movement.x));
+
+			view = Translate(V3(0.0, 1.0, -5.0f));
+			//view = LookAt_RH(V3(0,1,-5
+			if(flycam)
+			{
+				Basis basis = flycam_basis();
+				view = LookAt_RH(flycam_pos, AddV3(flycam_pos, basis.forward), V3(0, 1, 0));
+				//view = flycam_matrix();
+			}
+			else
+			{
+				view = LookAt_RH(cam_pos, player_pos, V3(0, 1, 0));
+			}
+			projection = Perspective_RH_NO(FIELD_OF_VIEW, screen_size().x / screen_size().y, NEAR_PLANE_DISTANCE, FAR_PLANE_DISTANCE);
+		}
 
 		float spin_factor = 0.5f;
 		float t = (float)elapsed_time * spin_factor;
@@ -5165,21 +5246,17 @@ void frame(void)
 
 	    Vec3 light_dir = NormV3(V3(x, -0.5, z));
 
-		Shadow_Volume_Params svp = calculate_shadow_volume_params(light_dir);
+		Shadow_Volume_Params svp = calculate_shadow_volume_params(light_dir, cam_pos, facing, right);
 
 		Mat4 shadow_view_matrix       = LookAt_RH(V3(0, 0, 0), light_dir, V3(0, 1, 0));
 		Mat4 shadow_projection_matrix = Orthographic_RH_NO(svp.l, svp.r, svp.b, svp.t, svp.n, svp.f);
 		Mat4 light_space_matrix = MulM4(shadow_projection_matrix, shadow_view_matrix);
 
+
 		do_shadow_pass(&state.shadows, shadow_view_matrix, shadow_projection_matrix);
 
+		// debug_draw_shadow_info(cam_pos, facing, right, light_space_matrix);
 
-		// make movement relative to camera forward
-		Vec3 facing = NormV3(SubV3(player_pos, cam_pos));
-		Vec3 right = Cross(facing, V3(0,1,0));
-		Vec2 forward_2d = NormV2(V2(facing.x, facing.z));
-		Vec2 right_2d = NormV2(V2(right.x, right.z));
-		movement = AddV2(MulV2F(forward_2d, movement.y), MulV2F(right_2d, movement.x));
 
 		sg_begin_default_pass(&state.clear_everything_pass_action, sapp_width(), sapp_height());
 
@@ -5187,19 +5264,7 @@ void frame(void)
 		state.threedee_bind.fs_images[SLOT_threedee_tex] = image_gigatexture;
 		state.threedee_bind.fs_images[SLOT_threedee_shadow_map] = state.shadows.color_img;
 
-		view = Translate(V3(0.0, 1.0, -5.0f));
-		//view = LookAt_RH(V3(0,1,-5
-		if(flycam)
-		{
-			Basis basis = flycam_basis();
-			view = LookAt_RH(flycam_pos, AddV3(flycam_pos, basis.forward), V3(0, 1, 0));
-			//view = flycam_matrix();
-		}
-		else
-		{
-			view = LookAt_RH(cam_pos, player_pos, V3(0, 1, 0));
-		}
-		projection = Perspective_RH_NO(FIELD_OF_VIEW, screen_size().x / screen_size().y, NEAR_PLANE_DISTANCE, FAR_PLANE_DISTANCE);
+
 
 		// debug draw armature
 		for(MD_u64 i = 0; i < armature.bones_length; i++)
